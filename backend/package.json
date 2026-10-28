@@ -1,0 +1,28 @@
+{
+  "name": "campusbid-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "async-mutex": "^0.5.0",
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^1.41.3",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "express-mongo-sanitize": "^2.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.11.4",
+    "multer": "^2.5.0",
+    "multer-storage-cloudinary": "^4.0.0",
+    "node-cron": "^4.6.0",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
