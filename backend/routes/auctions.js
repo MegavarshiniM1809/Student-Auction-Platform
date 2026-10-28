@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
-const { upload } = require('../config/cloudinary');
+const { uploadPhotos } = require('../config/cloudinary');
 const {
   getAuctions,
   createAuction,
@@ -14,9 +14,9 @@ const {
 } = require('../controllers/auctionController');
 
 router.get('/', getAuctions);
-router.post('/', protect, upload.array('photos', 5), createAuction);
+router.post('/', protect, uploadPhotos, createAuction);
 router.get('/:id', getAuction);
-router.patch('/:id', protect, updateAuction);
+router.patch('/:id', protect, uploadPhotos, updateAuction);
 router.post('/:id/cancel', protect, cancelAuction);
 router.post('/:id/bids', protect, placeBid);
 router.get('/:id/bids', getBids);

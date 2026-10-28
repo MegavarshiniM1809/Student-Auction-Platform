@@ -13,6 +13,16 @@ const AUCTION_STATUSES = [
   'PICKUP_FAILED',
 ];
 
+const cancellationSchema = new mongoose.Schema(
+  {
+    cancellationId: { type: mongoose.Schema.Types.ObjectId },
+    cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    reason: { type: String, default: '' },
+    cancelledAt: { type: Date },
+  },
+  { _id: false }
+);
+
 const auctionSchema = new mongoose.Schema(
   {
     sellerId: {
@@ -37,6 +47,10 @@ const auctionSchema = new mongoose.Schema(
       ],
     },
     description: { type: String, required: true },
+    descriptionAdditions: [{
+      text: { type: String, required: true, trim: true, maxlength: 1000 },
+      createdAt: { type: Date, required: true, default: Date.now },
+    }],
     condition: {
       type: String,
       required: true,
@@ -60,6 +74,7 @@ const auctionSchema = new mongoose.Schema(
       default: 'ACTIVE',
     },
     handoverDetails: { type: String, default: '' },
+    cancellation: { type: cancellationSchema, default: undefined },
     // For optimistic concurrency on bids
     version: { type: Number, default: 0 },
   },

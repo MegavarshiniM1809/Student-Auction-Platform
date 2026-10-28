@@ -12,9 +12,16 @@ const startAuctionCloser = (io) => {
       });
 
       for (const auction of expiredAuctions) {
-        if (auction.bidCount === 0) {
-          auction.status = 'UNSOLD';
-          await auction.save();
+        const now = new Date();
+        const nextStatus = auction.bidCount === 0 ? 'UNSOLD' : 'AWAITING_SELLER_DECISION';
+        const closedAuction = await Auction.findOneAndUpdate(
+          { _id: auction._id, status: 'ACTIVE', closesAt: { $lte: now } },
+          { $set: { status: nextStatus }, $inc: { version: 1 } },
+          { new: true }
+        );
+        if (!closedAuction) continue;
+
+        if (nextStatus === 'UNSOLD') {
           console.log(`[Cron] Auction ${auction._id} marked UNSOLD`);
 
           createNotification(
@@ -25,8 +32,6 @@ const startAuctionCloser = (io) => {
             io
           );
         } else {
-          auction.status = 'AWAITING_SELLER_DECISION';
-          await auction.save();
           console.log(`[Cron] Auction ${auction._id} → AWAITING_SELLER_DECISION`);
 
           // Notify seller

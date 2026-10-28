@@ -1,6 +1,8 @@
 const Auction = require('../models/Auction');
 const Bid = require('../models/Bid');
 const Transaction = require('../models/Transaction');
+const Notification = require('../models/Notification');
+const mongoose = require('mongoose');
 const { createNotification } = require('../utils/notifications');
 const { Mutex } = require('async-mutex');
 
@@ -11,6 +13,18 @@ const getMutex = (auctionId) => {
   if (!auctionMutexes.has(key)) auctionMutexes.set(key, new Mutex());
   return auctionMutexes.get(key);
 };
+
+const requestError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
+const getVersionFilter = (version) => (
+  version === 0 || version === undefined
+    ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
+    : { version }
+);
+const auctionPhotoUrl = (file) => (
+  file.path
+    ? file.path.startsWith('http') ? file.path : `/uploads/${file.filename}`
+    : file.secure_url || ''
+);
 
 // GET /api/auctions
 const getAuctions = async (req, res) => {
@@ -169,12 +183,28 @@ const createAuction = async (req, res) => {
 // Helper: check and close expired auction
 const checkAndCloseAuction = async (auction, io) => {
   if (auction.status !== 'ACTIVE') return auction;
-  if (new Date() < auction.closesAt) return auction;
+  const now = new Date();
+  if (now < auction.closesAt) return auction;
 
-  if (auction.bidCount === 0) {
-    auction.status = 'UNSOLD';
-  } else {
-    auction.status = 'AWAITING_SELLER_DECISION';
+  const nextStatus = auction.bidCount === 0 ? 'UNSOLD' : 'AWAITING_SELLER_DECISION';
+  const closedAuction = await Auction.findOneAndUpdate(
+    { _id: auction._id, status: 'ACTIVE', closesAt: { $lte: now } },
+    { $set: { status: nextStatus }, $inc: { version: 1 } },
+    { new: true }
+  );
+  if (!closedAuction) {
+    const currentAuction = await Auction.findById(auction._id);
+    if (currentAuction && auction.populated('sellerId')) {
+      await currentAuction.populate('sellerId', 'name department year contact');
+      if (currentAuction.leadingBidderId) {
+        await currentAuction.populate('leadingBidderId', 'name department');
+      }
+    }
+    return currentAuction || auction;
+  }
+  auction.status = nextStatus;
+  auction.version = closedAuction.version;
+  if (nextStatus === 'AWAITING_SELLER_DECISION') {
     // Notify seller
     if (io) {
       createNotification(
@@ -195,7 +225,6 @@ const checkAndCloseAuction = async (auction, io) => {
       }
     }
   }
-  await auction.save();
   return auction;
 };
 
@@ -228,56 +257,161 @@ const updateAuction = async (req, res) => {
     if (auction.sellerId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: 'Not your auction.' });
     }
-    if (auction.status !== 'ACTIVE' || auction.bidCount > 0) {
-      return res.status(400).json({ message: 'Cannot edit an auction that has bids.' });
+    const now = new Date();
+    if (auction.status !== 'ACTIVE') {
+      return res.status(400).json({ message: 'Only open auctions can be edited.' });
     }
-    if (auction.closesAt <= new Date()) {
-      return res.status(400).json({ message: 'Cannot edit an auction that has already closed.' });
+    if (auction.closesAt <= now) {
+      return res.status(400).json({ message: 'This auction has already ended and cannot be edited.' });
     }
 
-    const textFields = ['title', 'description', 'handoverDetails'];
-    for (const field of textFields) {
+    const validBidExists = await Bid.exists({ auctionId: auction._id });
+    const hasBids = auction.bidCount > 0 || !!validBidExists;
+    const allowedFields = new Set([
+      'descriptionAddition',
+      'title',
+      'category',
+      'condition',
+      'description',
+      'startingPrice',
+      'minIncrement',
+      'closesAt',
+      'handoverDetails',
+      'existingPhotos',
+      'photos',
+    ]);
+    const unknownField = Object.keys(req.body).find((field) => !allowedFields.has(field));
+    if (unknownField) {
+      return res.status(400).json({ message: `Field "${unknownField}" cannot be updated.` });
+    }
+
+    if (hasBids) {
+      if (Object.keys(req.body).length !== 1 || req.body.descriptionAddition === undefined || req.files?.length) {
+        return res.status(400).json({
+          message: 'Core auction details are locked after the first bid. Submit only a description addition.',
+        });
+      }
+      if (typeof req.body.descriptionAddition !== 'string') {
+        return res.status(400).json({ message: 'Description addition must be text.' });
+      }
+      const text = req.body.descriptionAddition.trim();
+      if (!text || text.length > 1000) {
+        return res.status(400).json({ message: 'Description addition must contain 1 to 1000 characters.' });
+      }
+
+      const updatedAuction = await Auction.findOneAndUpdate(
+        {
+          _id: auction._id,
+          sellerId: req.user._id,
+          status: 'ACTIVE',
+          closesAt: { $gt: now },
+          ...getVersionFilter(auction.version),
+        },
+        { $push: { descriptionAdditions: { text, createdAt: now } }, $inc: { version: 1 } },
+        { new: true, runValidators: true }
+      );
+      if (!updatedAuction) {
+        return res.status(409).json({ message: 'Auction changed while you were editing. Refresh and try again.' });
+      }
+      return res.json({ auction: updatedAuction });
+    }
+
+    if (req.body.descriptionAddition !== undefined) {
+      return res.status(400).json({ message: 'Use the original description field before the first bid.' });
+    }
+
+    const updates = {};
+    for (const field of ['title', 'description', 'handoverDetails']) {
       if (req.body[field] !== undefined) {
         if (typeof req.body[field] !== 'string') {
           return res.status(400).json({ message: `${field} must be text.` });
         }
-        auction[field] = req.body[field].trim();
+        updates[field] = req.body[field].trim();
       }
     }
-
-    ['category', 'condition'].forEach((field) => {
-      if (req.body[field] !== undefined) auction[field] = req.body[field];
-    });
-
+    if (updates.title !== undefined && (updates.title.length < 3 || updates.title.length > 120)) {
+      return res.status(400).json({ message: 'Title must contain 3 to 120 characters.' });
+    }
+    if (updates.description !== undefined && (!updates.description || updates.description.length > 5000)) {
+      return res.status(400).json({ message: 'Description must contain 1 to 5000 characters.' });
+    }
+    if (updates.handoverDetails !== undefined && updates.handoverDetails.length > 500) {
+      return res.status(400).json({ message: 'Handover details cannot exceed 500 characters.' });
+    }
+    for (const field of ['category', 'condition']) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
     for (const field of ['startingPrice', 'minIncrement']) {
       if (req.body[field] !== undefined) {
         const amount = Number(req.body[field]);
         if (!Number.isFinite(amount) || amount <= 0) {
           return res.status(400).json({ message: `${field} must be a positive amount.` });
         }
-        auction[field] = Math.round(amount * 100);
+        updates[field] = Math.round(amount * 100);
       }
     }
-
     if (req.body.closesAt !== undefined) {
       const closesAt = new Date(req.body.closesAt);
-      if (Number.isNaN(closesAt.getTime()) || closesAt <= new Date()) {
+      if (Number.isNaN(closesAt.getTime()) || closesAt <= now) {
         return res.status(400).json({ message: 'Closing date must be in the future.' });
       }
-      auction.closesAt = closesAt;
+      updates.closesAt = closesAt;
     }
-
-    if (!auction.title || !auction.description) {
+    const incomingFiles = (req.files || []).map(auctionPhotoUrl).filter(Boolean);
+    let photoSelection = req.body.existingPhotos ?? req.body.photos;
+    if (typeof photoSelection === 'string') {
+      try {
+        photoSelection = JSON.parse(photoSelection);
+      } catch {
+        return res.status(400).json({ message: 'Photo selection must be a valid list.' });
+      }
+    }
+    if (photoSelection !== undefined && !Array.isArray(photoSelection)) {
+      return res.status(400).json({ message: 'Photo selection must be a list.' });
+    }
+    if (photoSelection !== undefined || incomingFiles.length) {
+      const retainedPhotos = photoSelection === undefined ? auction.photos : photoSelection;
+      if (
+        retainedPhotos.some((photo) => typeof photo !== 'string' || !auction.photos.includes(photo)) ||
+        new Set(retainedPhotos).size !== retainedPhotos.length
+      ) {
+        return res.status(400).json({ message: 'Only existing auction photos can be retained.' });
+      }
+      updates.photos = [...retainedPhotos, ...incomingFiles];
+      if (updates.photos.length > 5) {
+        return res.status(400).json({ message: 'An auction can have at most 5 photos.' });
+      }
+    }
+    if (
+      updates.title === '' ||
+      updates.description === '' ||
+      (updates.title === undefined && !auction.title) ||
+      (updates.description === undefined && !auction.description)
+    ) {
       return res.status(400).json({ message: 'Title and description are required.' });
     }
 
-    await auction.save();
-    res.json({ auction });
+    const updatedAuction = await Auction.findOneAndUpdate(
+      {
+        _id: auction._id,
+        sellerId: req.user._id,
+        status: 'ACTIVE',
+        bidCount: 0,
+        closesAt: { $gt: now },
+        ...getVersionFilter(auction.version),
+      },
+      { $set: updates, $inc: { version: 1 } },
+      { new: true, runValidators: true }
+    );
+    if (!updatedAuction) {
+      return res.status(409).json({ message: 'A bid or another update arrived first. Refresh before editing.' });
+    }
+    res.json({ auction: updatedAuction });
   } catch (err) {
     if (err.name === 'ValidationError') {
       return res.status(400).json({ message: err.message });
     }
-    res.status(500).json({ message: err.message });
+    res.status(err.statusCode || 500).json({ message: err.message });
   } finally {
     release();
   }
@@ -287,33 +421,122 @@ const updateAuction = async (req, res) => {
 const cancelAuction = async (req, res) => {
   const mutex = getMutex(req.params.id);
   const release = await mutex.acquire();
+  const session = await mongoose.startSession();
   try {
-    const auction = await Auction.findById(req.params.id);
-    if (!auction) return res.status(404).json({ message: 'Auction not found.' });
-    if (auction.sellerId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not your auction.' });
+    const unexpectedField = Object.keys(req.body || {}).find((field) => field !== 'reason');
+    if (unexpectedField) {
+      return res.status(400).json({ message: `Field "${unexpectedField}" cannot be supplied when cancelling.` });
     }
-    if (auction.status !== 'ACTIVE') {
-      return res.status(400).json({ message: 'Only active auctions can be cancelled.' });
+    const reasonInput = req.body?.reason;
+    if (reasonInput !== undefined && typeof reasonInput !== 'string') {
+      return res.status(400).json({ message: 'Cancellation reason must be text.' });
     }
-    if (auction.bidCount > 0) {
-      return res.status(400).json({ message: 'Cannot cancel an auction after it has received bids.' });
-    }
-    if (auction.closesAt <= new Date()) {
-      return res.status(400).json({ message: 'Cannot cancel an auction that has already closed.' });
+    const reason = typeof reasonInput === 'string' ? reasonInput.trim() : '';
+    if (reason.length > 1000) {
+      return res.status(400).json({ message: 'Cancellation reason cannot exceed 1000 characters.' });
     }
 
-    auction.status = 'CANCELLED';
-    await auction.save();
+    const cancellationId = new mongoose.Types.ObjectId();
+    let cancelledAuction;
+    let notifiedUsers = [];
+    await session.withTransaction(async () => {
+      const auction = await Auction.findById(req.params.id).session(session);
+      if (!auction) throw requestError(404, 'Auction not found.');
+      if (auction.sellerId.toString() !== req.user._id.toString()) {
+        throw requestError(403, 'Not your auction.');
+      }
+      if (auction.status !== 'ACTIVE') {
+        const hint = auction.status === 'AWAITING_SELLER_DECISION'
+          ? ' Use the existing Reject flow if you do not want to proceed with the winning bid.'
+          : '';
+        throw requestError(400, `This auction has ended and cannot be cancelled.${hint}`);
+      }
 
-    req.app.get('io')?.to(`auction:${auction._id.toString()}`).emit('auction_status_changed', {
-      status: auction.status,
+      const now = new Date();
+      if (auction.closesAt <= now) {
+        throw requestError(
+          400,
+          'This auction has ended. Cancellation is unavailable; use the existing Reject flow if it is awaiting your decision.'
+        );
+      }
+      const bidderIds = await Bid.find({ auctionId: auction._id })
+        .distinct('bidderId')
+        .session(session);
+      const hasBids = auction.bidCount > 0 || bidderIds.length > 0;
+      if (hasBids && !reason) {
+        throw requestError(400, 'A cancellation reason is required after the first bid.');
+      }
+
+      const updated = await Auction.findOneAndUpdate(
+        {
+          _id: auction._id,
+          sellerId: req.user._id,
+          status: 'ACTIVE',
+          closesAt: { $gt: now },
+          bidCount: auction.bidCount,
+          ...getVersionFilter(auction.version),
+        },
+        {
+          $set: {
+            status: 'CANCELLED',
+            cancellation: {
+              cancellationId,
+              cancelledBy: req.user._id,
+              reason,
+              cancelledAt: now,
+            },
+          },
+          $inc: { version: 1 },
+        },
+        { new: true, runValidators: true, session }
+      );
+      if (!updated) {
+        throw requestError(409, 'A bid or another auction update arrived first. Refresh and try again.');
+      }
+
+      notifiedUsers = bidderIds.map((id) => id.toString());
+      const message = `The seller cancelled "${auction.title}". Reason: ${reason}`;
+      if (bidderIds.length) {
+        await Notification.bulkWrite(
+          bidderIds.map((userId) => ({
+            updateOne: {
+              filter: { userId, cancellationId },
+              update: {
+                $setOnInsert: {
+                  userId,
+                  type: 'AUCTION_CANCELLED',
+                  message,
+                  auctionId: auction._id,
+                  cancellationId,
+                  isRead: false,
+                },
+              },
+              upsert: true,
+            },
+          })),
+          { session }
+        );
+      }
+      cancelledAuction = updated;
     });
 
-    res.json({ auction });
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`auction:${cancelledAuction._id.toString()}`).emit('auction_status_changed', {
+        status: 'CANCELLED',
+        cancellation: cancelledAuction.cancellation,
+      });
+      const notifications = await Notification.find({ cancellationId }).lean();
+      notifications.forEach((notification) => {
+        io.to(`user:${notification.userId.toString()}`).emit('notification', notification);
+      });
+    }
+
+    res.json({ auction: cancelledAuction, notifiedBidderCount: notifiedUsers.length });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    res.status(err.statusCode || 500).json({ message: err.message });
   } finally {
+    await session.endSession();
     release();
   }
 };
@@ -322,69 +545,70 @@ const cancelAuction = async (req, res) => {
 const placeBid = async (req, res) => {
   const mutex = getMutex(req.params.id);
   const release = await mutex.acquire();
+  const session = await mongoose.startSession();
   try {
     const io = req.app.get('io');
-    const auction = await Auction.findById(req.params.id);
-    if (!auction) return res.status(404).json({ message: 'Auction not found.' });
-
-    // Check status & time — server authoritative
-    if (auction.status !== 'ACTIVE') {
-      return res.status(400).json({ message: 'This auction is not open for bidding.' });
-    }
-    if (new Date() >= auction.closesAt) {
-      // Close it now
-      await checkAndCloseAuction(auction, io);
-      return res.status(400).json({ message: 'Auction has already closed.' });
-    }
-
-    // Self-bid prevention
-    if (auction.sellerId.toString() === req.user._id.toString()) {
-      return res.status(403).json({ message: 'You cannot bid on your own listing.' });
-    }
-
     const amountINR = Number(req.body.amount);
-    if (!amountINR || isNaN(amountINR)) {
+    if (!Number.isFinite(amountINR) || amountINR <= 0) {
       return res.status(400).json({ message: 'Invalid bid amount.' });
     }
     const amountPaise = Math.round(amountINR * 100);
-
-    // Validate amount
-    if (auction.bidCount === 0) {
-      // First bid: must be >= startingPrice
-      if (amountPaise < auction.startingPrice) {
-        return res.status(400).json({
-          message: `First bid must be at least ₹${(auction.startingPrice / 100).toFixed(2)}.`,
-        });
+    let auction;
+    let bid;
+    let previousLeader;
+    await session.withTransaction(async () => {
+      auction = await Auction.findById(req.params.id).session(session);
+      if (!auction) throw requestError(404, 'Auction not found.');
+      if (auction.status !== 'ACTIVE') {
+        throw requestError(400, 'This auction is not open for bidding.');
       }
-    } else {
-      // Subsequent: must be >= currentBid + minIncrement
-      const minRequired = auction.currentBid + auction.minIncrement;
-      if (amountPaise < minRequired) {
-        return res.status(400).json({
-          message: `Bid must be at least ₹${(minRequired / 100).toFixed(2)}.`,
-        });
+      const now = new Date();
+      if (now >= auction.closesAt) {
+        throw requestError(400, 'Auction has already closed.');
       }
-    }
+      if (auction.sellerId.toString() === req.user._id.toString()) {
+        throw requestError(403, 'You cannot bid on your own listing.');
+      }
+      const minimumBid = auction.bidCount === 0
+        ? auction.startingPrice
+        : auction.currentBid + auction.minIncrement;
+      if (amountPaise < minimumBid) {
+        throw requestError(
+          400,
+          auction.bidCount === 0
+            ? `First bid must be at least ₹${(minimumBid / 100).toFixed(2)}.`
+            : `Bid must be at least ₹${(minimumBid / 100).toFixed(2)}.`
+        );
+      }
 
-    const previousLeader = auction.leadingBidderId;
-    const sequenceNumber = auction.bidCount + 1;
-
-    // Create bid record
-    const bid = await Bid.create({
-      auctionId: auction._id,
-      bidderId: req.user._id,
-      amount: amountPaise,
-      sequenceNumber,
+      previousLeader = auction.leadingBidderId;
+      const sequenceNumber = auction.bidCount + 1;
+      const updatedAuction = await Auction.findOneAndUpdate(
+        {
+          _id: auction._id,
+          status: 'ACTIVE',
+          closesAt: { $gt: now },
+          bidCount: auction.bidCount,
+          ...getVersionFilter(auction.version),
+        },
+        {
+          $set: { currentBid: amountPaise, leadingBidderId: req.user._id },
+          $inc: { bidCount: 1, version: 1 },
+        },
+        { new: true, session }
+      );
+      if (!updatedAuction) {
+        throw requestError(409, 'Auction changed before your bid was placed. Refresh and try again.');
+      }
+      [bid] = await Bid.create([{
+        auctionId: auction._id,
+        bidderId: req.user._id,
+        amount: amountPaise,
+        sequenceNumber,
+      }], { session });
+      auction = updatedAuction;
     });
 
-    // Update auction
-    auction.currentBid = amountPaise;
-    auction.leadingBidderId = req.user._id;
-    auction.bidCount = sequenceNumber;
-    auction.version += 1;
-    await auction.save();
-
-    // Populate for response
     const populatedBid = await Bid.findById(bid._id).populate('bidderId', 'name department');
 
     // Emit to auction room
@@ -423,8 +647,13 @@ const placeBid = async (req, res) => {
       nextMinBid: amountPaise + auction.minIncrement,
     });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    if (err.statusCode === 400 && err.message === 'Auction has already closed.') {
+      const expiredAuction = await Auction.findById(req.params.id);
+      if (expiredAuction) await checkAndCloseAuction(expiredAuction, req.app.get('io'));
+    }
+    res.status(err.statusCode || (err.name === 'ValidationError' ? 400 : 500)).json({ message: err.message });
   } finally {
+    await session.endSession();
     release();
   }
 };

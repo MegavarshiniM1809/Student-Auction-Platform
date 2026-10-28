@@ -30,11 +30,16 @@ const notificationSchema = new mongoose.Schema(
       ref: 'Auction',
       default: null,
     },
+    cancellationId: { type: mongoose.Schema.Types.ObjectId },
     isRead: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
 
 notificationSchema.index({ userId: 1, isRead: 1, createdAt: -1 });
+notificationSchema.index(
+  { userId: 1, cancellationId: 1 },
+  { unique: true, partialFilterExpression: { cancellationId: { $type: 'objectId' } } }
+);
 
 module.exports = mongoose.model('Notification', notificationSchema);
