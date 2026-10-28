@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const mongoSanitize = require('express-mongo-sanitize');
 const path = require('path');
-require('dotenv').config();
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 
 const connectDB = require('./config/db');
 const { startAuctionCloser } = require('./jobs/auctionCloser');
