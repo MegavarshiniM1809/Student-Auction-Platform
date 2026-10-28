@@ -29,8 +29,33 @@ const getAuctions = async (req, res) => {
 
     const query = {};
 
-    // Default: show ACTIVE auctions unless specified
-    if (status) {
+    // Keep the default active-only behavior for existing API clients.
+    if (status === 'ALL') {
+      query.status = {
+        $in: [
+          'ACTIVE',
+          'BIDDING_CLOSED',
+          'UNSOLD',
+          'AWAITING_SELLER_DECISION',
+          'RESERVED',
+          'REJECTED',
+          'COMPLETED',
+          'CANCELLED',
+          'PICKUP_FAILED',
+        ],
+      };
+    } else if (status === 'ENDED') {
+      query.status = {
+        $in: [
+          'BIDDING_CLOSED',
+          'UNSOLD',
+          'AWAITING_SELLER_DECISION',
+          'REJECTED',
+          'CANCELLED',
+          'PICKUP_FAILED',
+        ],
+      };
+    } else if (status) {
       query.status = status;
     } else {
       query.status = { $in: ['ACTIVE'] };
@@ -195,6 +220,8 @@ const getAuction = async (req, res) => {
 
 // PATCH /api/auctions/:id
 const updateAuction = async (req, res) => {
+  const mutex = getMutex(req.params.id);
+  const release = await mutex.acquire();
   try {
     const auction = await Auction.findById(req.params.id);
     if (!auction) return res.status(404).json({ message: 'Auction not found.' });
@@ -204,15 +231,90 @@ const updateAuction = async (req, res) => {
     if (auction.status !== 'ACTIVE' || auction.bidCount > 0) {
       return res.status(400).json({ message: 'Cannot edit an auction that has bids.' });
     }
+    if (auction.closesAt <= new Date()) {
+      return res.status(400).json({ message: 'Cannot edit an auction that has already closed.' });
+    }
 
-    const allowed = ['title', 'description', 'handoverDetails', 'closesAt'];
-    allowed.forEach((field) => {
+    const textFields = ['title', 'description', 'handoverDetails'];
+    for (const field of textFields) {
+      if (req.body[field] !== undefined) {
+        if (typeof req.body[field] !== 'string') {
+          return res.status(400).json({ message: `${field} must be text.` });
+        }
+        auction[field] = req.body[field].trim();
+      }
+    }
+
+    ['category', 'condition'].forEach((field) => {
       if (req.body[field] !== undefined) auction[field] = req.body[field];
     });
+
+    for (const field of ['startingPrice', 'minIncrement']) {
+      if (req.body[field] !== undefined) {
+        const amount = Number(req.body[field]);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          return res.status(400).json({ message: `${field} must be a positive amount.` });
+        }
+        auction[field] = Math.round(amount * 100);
+      }
+    }
+
+    if (req.body.closesAt !== undefined) {
+      const closesAt = new Date(req.body.closesAt);
+      if (Number.isNaN(closesAt.getTime()) || closesAt <= new Date()) {
+        return res.status(400).json({ message: 'Closing date must be in the future.' });
+      }
+      auction.closesAt = closesAt;
+    }
+
+    if (!auction.title || !auction.description) {
+      return res.status(400).json({ message: 'Title and description are required.' });
+    }
+
     await auction.save();
     res.json({ auction });
   } catch (err) {
+    if (err.name === 'ValidationError') {
+      return res.status(400).json({ message: err.message });
+    }
     res.status(500).json({ message: err.message });
+  } finally {
+    release();
+  }
+};
+
+// POST /api/auctions/:id/cancel
+const cancelAuction = async (req, res) => {
+  const mutex = getMutex(req.params.id);
+  const release = await mutex.acquire();
+  try {
+    const auction = await Auction.findById(req.params.id);
+    if (!auction) return res.status(404).json({ message: 'Auction not found.' });
+    if (auction.sellerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your auction.' });
+    }
+    if (auction.status !== 'ACTIVE') {
+      return res.status(400).json({ message: 'Only active auctions can be cancelled.' });
+    }
+    if (auction.bidCount > 0) {
+      return res.status(400).json({ message: 'Cannot cancel an auction after it has received bids.' });
+    }
+    if (auction.closesAt <= new Date()) {
+      return res.status(400).json({ message: 'Cannot cancel an auction that has already closed.' });
+    }
+
+    auction.status = 'CANCELLED';
+    await auction.save();
+
+    req.app.get('io')?.to(`auction:${auction._id.toString()}`).emit('auction_status_changed', {
+      status: auction.status,
+    });
+
+    res.json({ auction });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  } finally {
+    release();
   }
 };
 
@@ -448,6 +550,7 @@ module.exports = {
   createAuction,
   getAuction,
   updateAuction,
+  cancelAuction,
   placeBid,
   getBids,
   sellerDecision,

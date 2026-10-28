@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api/axios';
 import AuctionCard from '../components/AuctionCard';
-import { Search, SlidersHorizontal, Plus, TrendingUp, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Search as SearchIcon, Plus, TrendingUp, ChevronLeft, ChevronRight, RotateCcw } from 'lucide-react';
 import { CATEGORIES, CONDITIONS } from '../utils/helpers';
 import { useAuth } from '../context/AuthContext';
 import toast from 'react-hot-toast';
@@ -14,8 +14,9 @@ const SORT_OPTIONS = [
 ];
 
 const STATUS_TABS = [
+  { value: 'ALL', label: 'All' },
   { value: 'ACTIVE', label: 'Live' },
-  { value: 'AWAITING_SELLER_DECISION', label: 'Ended' },
+  { value: 'ENDED', label: 'Ended' },
   { value: 'RESERVED', label: 'Reserved' },
   { value: 'COMPLETED', label: 'Completed' },
 ];
@@ -24,15 +25,27 @@ const Home = () => {
   const { user } = useAuth();
   const [auctions, setAuctions] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [filters, setFilters] = useState({ search: '', category: '', condition: '', sort: 'newest', status: 'ACTIVE', page: 1 });
+  const [filters, setFilters] = useState({
+    search: '',
+    category: '',
+    condition: '',
+    minPrice: '',
+    maxPrice: '',
+    sort: 'newest',
+    status: 'ALL',
+    page: 1,
+  });
   const [pagination, setPagination] = useState({ total: 0, pages: 1 });
-  const [showFilters, setShowFilters] = useState(false);
 
   const fetchAuctions = useCallback(async () => {
     setLoading(true);
     try {
       const params = { ...filters };
-      Object.keys(params).forEach(k => !params[k] && delete params[k]);
+      Object.keys(params).forEach((key) => {
+        if (params[key] === '' || params[key] === undefined || params[key] === null) {
+          delete params[key];
+        }
+      });
       const { data } = await api.get('/auctions', { params });
       setAuctions(data.auctions);
       setPagination({ total: data.total, pages: data.pages });
@@ -46,6 +59,16 @@ const Home = () => {
   useEffect(() => { fetchAuctions(); }, [fetchAuctions]);
 
   const setFilter = (key, value) => setFilters(prev => ({ ...prev, [key]: value, page: 1 }));
+  const clearFilters = () => setFilters({
+    search: '',
+    category: '',
+    condition: '',
+    minPrice: '',
+    maxPrice: '',
+    sort: 'newest',
+    status: 'ALL',
+    page: 1,
+  });
 
   return (
     <div className="page-content max-w-7xl mx-auto px-4 sm:px-6 py-8 fade-in">
@@ -62,80 +85,102 @@ const Home = () => {
         </div>
       )}
 
-      {/* Status Tabs */}
-      <div className="flex gap-1 mb-6 p-1 glass rounded-xl overflow-x-auto">
-        {STATUS_TABS.map(tab => (
-          <button
-            key={tab.value}
-            onClick={() => setFilter('status', tab.value)}
-            className={`flex-shrink-0 px-4 py-2 rounded-lg text-sm font-medium transition-all ${filters.status === tab.value ? 'bg-amber-500 text-black' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Search and Filters */}
-      <div className="space-y-3 mb-6">
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <div className="relative flex-1">
-            <Search size={17} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-            <input
-              className="input pl-10"
-              placeholder="Search by title or description..."
-              value={filters.search}
-              onChange={e => setFilter('search', e.target.value)}
-            />
-          </div>
-          <button onClick={() => setShowFilters(!showFilters)} className={`btn btn-secondary ${showFilters ? 'border-amber-500/50 text-amber-400' : ''}`}>
-            <SlidersHorizontal size={16} /> Filters
-          </button>
-          <select className="input w-full sm:w-40" value={filters.sort} onChange={e => setFilter('sort', e.target.value)}>
-            {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-          </select>
+      <div className="mb-6 space-y-4">
+        <div id="auction-search" className="relative">
+          <SearchIcon size={17} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+          <input
+            className="input pl-10"
+            aria-label="Search auctions"
+            placeholder="Search by title or description..."
+            value={filters.search}
+            onChange={(event) => setFilter('search', event.target.value)}
+          />
         </div>
 
-        {showFilters && (
-          <div className="glass p-4 rounded-xl fade-in grid grid-cols-2 md:grid-cols-4 gap-3">
+        <section className="glass rounded-2xl p-4 sm:p-5" aria-label="Auction filters">
+          <div className="mb-4">
+            <p className="mb-2 text-sm font-semibold text-slate-700">Auction status</p>
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Filter by auction status">
+              {STATUS_TABS.map((tab) => (
+                <button
+                  key={tab.value}
+                  type="button"
+                  onClick={() => setFilter('status', tab.value)}
+                  aria-pressed={filters.status === tab.value}
+                  className={`rounded-full border px-4 py-2 text-sm font-medium transition-colors ${
+                    filters.status === tab.value
+                      ? 'border-amber-500 bg-amber-100 text-amber-900'
+                      : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300 hover:bg-amber-50'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-[1.2fr_1fr_1fr_1fr]">
             <div>
               <label className="label">Category</label>
-              <select className="input" value={filters.category} onChange={e => setFilter('category', e.target.value)}>
+              <select className="input" value={filters.category} onChange={event => setFilter('category', event.target.value)}>
                 <option value="">All Categories</option>
-                {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                {CATEGORIES.map(category => <option key={category} value={category}>{category}</option>)}
               </select>
             </div>
             <div>
               <label className="label">Condition</label>
-              <select className="input" value={filters.condition} onChange={e => setFilter('condition', e.target.value)}>
+              <select className="input" value={filters.condition} onChange={event => setFilter('condition', event.target.value)}>
                 <option value="">Any Condition</option>
-                {CONDITIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                {CONDITIONS.map(condition => <option key={condition} value={condition}>{condition}</option>)}
               </select>
             </div>
             <div>
-              <label className="label">Min Price (₹)</label>
-              <input className="input" type="number" placeholder="0" value={filters.minPrice || ''} onChange={e => setFilter('minPrice', e.target.value)} />
+              <label className="label" htmlFor="min-price">Minimum price (₹)</label>
+              <input
+                id="min-price"
+                className="input"
+                type="number"
+                min="0"
+                placeholder="No minimum"
+                value={filters.minPrice}
+                onChange={event => setFilter('minPrice', event.target.value)}
+              />
             </div>
             <div>
-              <label className="label">Max Price (₹)</label>
-              <input className="input" type="number" placeholder="Any" value={filters.maxPrice || ''} onChange={e => setFilter('maxPrice', e.target.value)} />
+              <label className="label" htmlFor="max-price">Maximum price (₹)</label>
+              <input
+                id="max-price"
+                className="input"
+                type="number"
+                min="0"
+                placeholder="No maximum"
+                value={filters.maxPrice}
+                onChange={event => setFilter('maxPrice', event.target.value)}
+              />
             </div>
-            <button onClick={() => setFilters({ search: '', category: '', condition: '', sort: 'newest', status: filters.status, page: 1 })} className="btn btn-secondary btn-sm col-span-full w-fit">
-              Clear Filters
-            </button>
           </div>
-        )}
+          <button type="button" onClick={clearFilters} className="btn btn-secondary btn-sm mt-4">
+            <RotateCcw size={14} /> Clear all filters
+          </button>
+        </section>
       </div>
 
-      {/* Results count */}
-      <div className="flex items-center justify-between mb-4">
+      {/* Sort and result count */}
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-gray-400">
           {loading ? 'Loading...' : `${pagination.total} auction${pagination.total !== 1 ? 's' : ''} found`}
         </p>
-        {user && (
-          <Link to="/auctions/create" className="btn btn-primary btn-sm">
-            <Plus size={14} /> List an Item
-          </Link>
-        )}
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <label htmlFor="auction-sort" className="text-sm text-gray-500">Sort by</label>
+          <select id="auction-sort" className="input w-full sm:w-48" value={filters.sort} onChange={event => setFilter('sort', event.target.value)}>
+            {SORT_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          {user && (
+            <Link to="/auctions/create" className="btn btn-primary btn-sm justify-center">
+              <Plus size={14} /> List an Item
+            </Link>
+          )}
+        </div>
       </div>
 
       {/* Grid */}
