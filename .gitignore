@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+implementation_plan.md
+backend.zip
+frontend_dup.zip
+frontend_dup/
